@@ -1,24 +1,40 @@
 from time import time
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-from imblearn.over_sampling import SMOTE
 
-from mimic import get_mimic_iv_22_demo
 from covid import get_covid_19
+from mimic import get_mimic_iv_31, get_mimic_iv_22_demo
+from misc import prepare_data_for_training
 
 
-def train_on_data(data, name='MIMIC-IV 2.2 Demo'):
+def main():
+    name = 'MIMIC-IV 3.1'
+    # name = 'COVID-19'
+    print(f'Loading {name} data...')
+
+    data_load_start = time()
+    match name:
+        case 'MIMIC-IV 3.1':
+            data = get_mimic_iv_31()
+        case 'MIMIC-IV 2.2 Demo':
+            data = get_mimic_iv_22_demo()
+        case 'COVID-19':
+            data = get_covid_19()
+        case _:
+            raise ValueError(f"Unknown dataset: {name}")
+    data_load_end = time()
+
+    print(f"Data loaded in {data_load_end - data_load_start} seconds")
+
     print(f'Training on {name}...')
     start_time = time()
 
-    # Assume `X` are your features and `y` is 'icu_within_24h'
-    X, y = data
-    print(f"Data to process: {X.shape[0]} rows, {X.shape[1]} columns")
-    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y)
+    X_train, y_train, X_test, y_test = prepare_data_for_training(
+        data[0], data[1], test_size=0.2, random_state=42
+    )
 
-    clf = RandomForestClassifier()
+    clf = RandomForestClassifier(class_weight='balanced', n_jobs=-1)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
@@ -26,13 +42,6 @@ def train_on_data(data, name='MIMIC-IV 2.2 Demo'):
 
     print(classification_report(y_test, y_pred))
     print(f"Time elapsed: {end_time - start_time} seconds")
-
-
-def main():
-    # mimic_demo = get_mimic_iv_22_demo()
-    # train_on_data(mimic_demo, name='MIMIC-IV 2.2 Demo')
-    covid_data = get_covid_19()
-    train_on_data(covid_data, name='COVID-19 Data')
 
 
 if __name__ == '__main__':
