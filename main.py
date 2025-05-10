@@ -4,7 +4,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 
 from covid import get_covid_19
-from mimic import get_mimic_iv_31, get_mimic_iv_22_demo
+from mimic import get_mimic_iv_31
 from misc import prepare_data_for_training
 
 
@@ -17,8 +17,6 @@ def main():
     match name:
         case 'MIMIC-IV 3.1':
             data = get_mimic_iv_31()
-        case 'MIMIC-IV 2.2 Demo':
-            data = get_mimic_iv_22_demo()
         case 'COVID-19':
             data = get_covid_19()
         case _:
