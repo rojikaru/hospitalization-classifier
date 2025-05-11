@@ -1,10 +1,19 @@
-from imblearn.combine import SMOTEENN
+import gc
+from random import randint
+
+import cudf
+import numpy as np
+from cuml import RandomForestClassifier, accuracy_score
+from cuml.model_selection import StratifiedKFold
+from cuml.preprocessing import OneHotEncoder
+from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
+from imblearn.under_sampling import RandomUnderSampler
+from numba.cuda import current_context
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler
 
 
 def build_preprocessor(numeric_cols, categorical_cols):
@@ -44,10 +53,52 @@ def prepare_data_split(
 
 def build_model_pipeline(preprocessor, model=None):
     if model is None:
-        model = RandomForestClassifier(class_weight='balanced', n_jobs=-1)
+        model = RandomForestClassifier(
+            n_estimators=500,
+            n_streams=1,
+            random_state=randint(0, 1000)
+        )
 
     return Pipeline([
         ('preprocessing', preprocessor),
-        ('smote', SMOTEENN(random_state=42)),
+        ('smote', SMOTE(random_state=randint(0, 1000))),
+        # ('undersample', RandomUnderSampler(random_state=42)),
         ('classifier', model)
     ], verbose=True)
+
+def objective(trial, X, y):
+    # Suggest hyperparameters
+    search_space = {
+        'n_estimators': trial.suggest_int("n_estimators", 50, 100),
+        'max_depth': trial.suggest_int("max_depth", 3, 10),
+        'min_samples_leaf': trial.suggest_int("min_samples_leaf", 1, 5)
+    }
+
+    # Cross-validation
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=randint(0, 1000))
+    scores = []
+
+    for train_idx, val_idx in cv.split(X, y):
+        X_train_cv, X_val_cv = X.iloc[train_idx.get()], X.iloc[val_idx.get()]
+        y_train_cv, y_val_cv = y.iloc[train_idx.get()], y.iloc[val_idx.get()]
+
+        model = RandomForestClassifier(
+            n_estimators=search_space['n_estimators'],
+            n_streams=1,
+            max_depth=search_space['max_depth'],
+            min_samples_leaf=search_space['min_samples_leaf'],
+            random_state=randint(0, 1000),
+        )
+
+        X_train_cv = cudf.DataFrame.from_pandas(X_train_cv)
+        y_train_cv = cudf.Series(y_train_cv)
+
+        model.fit(X_train_cv, y_train_cv)
+        preds = model.predict(X_val_cv)
+        acc = accuracy_score(y_val_cv.to_numpy(), preds)
+        scores.append(acc)
+
+        gc.collect()
+        current_context().deallocations.clear()
+
+    return np.mean(scores)
