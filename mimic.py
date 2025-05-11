@@ -1,10 +1,10 @@
 import gc
 import os
-from collections import defaultdict
 from hashlib import md5
-
 import joblib
+import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
@@ -41,31 +41,24 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         f'{data_path}/hosp/admissions.csv.gz',
         compression='gzip',
         usecols=['subject_id', 'hadm_id', 'admittime', 'dischtime', 'admission_type', 'admission_location',
-                 'discharge_location', 'insurance', 'language', 'marital_status', 'race', 'hospital_expire_flag']
+                 'discharge_location', 'insurance', 'language', 'marital_status', 'race', 'hospital_expire_flag'],
+        parse_dates=['admittime', 'dischtime'],
     )
     patients = pd.read_csv(
         f'{data_path}/hosp/patients.csv.gz',
         compression='gzip',
-        usecols=['subject_id', 'gender', 'anchor_age', 'anchor_year', 'anchor_year_group', 'dod']
+        usecols=['subject_id', 'gender', 'anchor_age', 'anchor_year', 'anchor_year_group', 'dod'],
+        parse_dates=['dod']
     )
     icustays = pd.read_csv(
         f'{data_path}/icu/icustays.csv.gz',
         compression='gzip',
-        usecols=['subject_id', 'hadm_id', 'stay_id', 'intime', 'outtime', 'los']
+        usecols=['subject_id', 'hadm_id', 'stay_id', 'intime', 'outtime', 'los'],
+        parse_dates=['intime', 'outtime']
     )
 
     # Merge patient demographics to admissions
     base = admissions.merge(patients, on='subject_id', how='left')
-
-    # Convert time columns to datetime (admissions and patients base)
-    time_cols_base = ['admittime', 'dischtime', 'dod']
-    for col in time_cols_base:
-        base[col] = pd.to_datetime(base[col], errors='coerce')
-
-    # Convert time columns in icustays
-    time_cols_icu = ['intime', 'outtime']
-    for col in time_cols_icu:
-        icustays[col] = pd.to_datetime(icustays[col], errors='coerce')
 
     # --- Target Variable: 30-day Readmission ---
     # Sort by subject_id and admittime to find the next admission
@@ -122,9 +115,14 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     # Identify top N common diagnoses (Example: top 50 or 100, adjust as needed)
     # We'll use the first listed diagnosis (seq_num == 1) as it's often the primary reason for admission
     primary_diagnoses = diagnoses_icd[diagnoses_icd['seq_num'] == 1]
-    common_diag_codes = primary_diagnoses['icd_code'].value_counts().nlargest(100).index.tolist() # Top 100 primary diagnoses
+    common_diag_codes = (primary_diagnoses['icd_code']
+                         .value_counts()
+                         .nlargest(100)
+                         .index
+                         .tolist())  # Top 100 primary diagnoses
 
-    print(f"Creating binary features for {len(common_diag_codes)} common primary diagnoses...")
+    print(f"Creating binary features for {len(common_diag_codes)} "
+          f"common primary diagnoses...")
     new_diag_features_list = []
 
     # Iterate through common codes and create a Series for each
@@ -135,11 +133,13 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         # Create a boolean Series, indexed by hadm_id, indicating presence
         # Use base['hadm_id'].isin(...) but create the Series outside the base DataFrame
         is_present = base['hadm_id'].isin(hadm_ids_with_code).astype(int)
-        is_present.name = col_name # Name the Series with the desired column name
+        is_present.name = col_name  # Name the Series with the desired column name
         new_diag_features_list.append(is_present)
 
     # Concatenate all the new Series into a single DataFrame
     new_diag_features_df = pd.concat(new_diag_features_list, axis=1)
+    # Ensure the index of new_diag_features_df aligns with base before merging on index
+    new_diag_features_df.index = base.index
     base = base.merge(new_diag_features_df, left_index=True, right_index=True, how='left')
 
     # Procedure Features - Keep count (this part was fine)
@@ -172,67 +172,100 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     print(f"Processing labevents for {len(target_itemids_lab)} target lab itemids...")
 
     # Load and filter lab events with charttime
-    agg_all = defaultdict(list)
-    agg_24h = defaultdict(list)
+    reader = pd.read_csv(
+        f'{data_path}/hosp/labevents.csv.gz',
+        usecols=['subject_id', 'hadm_id', 'itemid', 'charttime', 'valuenum'],
+        compression='gzip',
+        chunksize=1_000_000,
+        dtype={
+            'subject_id': 'int32',
+            'hadm_id': 'float32',  # float because some might be NaN
+            'itemid': 'int32',
+            'valuenum': 'float32'
+        },
+        parse_dates=['charttime']
+    )
 
-    for chunk in pd.read_csv(
-            f'{data_path}/hosp/labevents.csv.gz',
-            usecols=['subject_id', 'hadm_id', 'itemid', 'charttime', 'valuenum'],
-            compression='gzip',
-            chunksize=1_000_000
-    ):
-        chunk = chunk[chunk['itemid'].isin(target_itemids_lab)].copy()
-        chunk['charttime'] = pd.to_datetime(chunk['charttime'], errors='coerce')
+    lab_all_stay_chunks = []
+    lab_24h_chunks = []
 
-        chunk = chunk.merge(base[['hadm_id', 'admittime']], on='hadm_id', how='left')
-        chunk['time_from_admit'] = (chunk['charttime'] - chunk['admittime']).dt.total_seconds() / 3600.0
-
-        chunk = chunk.merge(labitems[['itemid', 'label']], on='itemid', how='left')
-
-        # Filter 24h for this chunk
-        chunk_24h = chunk[(chunk['time_from_admit'] >= 0) & (chunk['time_from_admit'] <= 24)]
-
-        # Group and aggregate in each chunk (this avoids storing all rows)
-        for df, storage, suffix in [(chunk, agg_all, 'allstay'), (chunk_24h, agg_24h, '24h')]:
-            grouped = df.groupby(['hadm_id', 'label'])['valuenum'].agg(
-                ['mean', 'std', 'min', 'max', 'first', 'last'])
-            for (hadm_id, label), row in grouped.iterrows():
-                for stat in ['mean', 'std', 'min', 'max', 'first', 'last']:
-                    col_name = f"lab_{label.lower().replace(' ', '_')}_{stat}_{suffix}"
-                    storage[(hadm_id, col_name)].append(row[stat])
-
+    for chunk in tqdm(reader):
         gc.collect()
 
-    # Collapse into filtered labs
-    labs_filtered = pd.concat([agg_all.values(), agg_24h.values()], ignore_index=True)
+        # Use .copy() to avoid SettingWithCopyWarning
+        chunk = chunk[chunk['itemid'].isin(target_itemids_lab)].copy()
 
-    # Define time windows (e.g., first 24 hours)
-    window_24h_mask = (labs_filtered['time_from_admit'] >= 0) & (labs_filtered['time_from_admit'] <= 24)
+        if chunk.empty:
+            continue
 
-    # Aggregate temporal lab features
-    lab_temporal_features_list = []
+        # Merge with admissions to get admittime for time window calculations
+        # Ensure hadm_id is int for merging
+        chunk['hadm_id'] = chunk['hadm_id'].astype('Int64')  # Use nullable Int64
 
-    # Aggregate over the entire stay
-    agg_all_stay = labs_filtered.groupby(['hadm_id', 'label'])['valuenum'].agg(
-        ['mean', 'std', 'min', 'max', 'first', 'last']).unstack()
-    agg_all_stay.columns = [
-        f"lab_{'_'.join(map(str, col)).strip().replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')}_allstay"
-        for col in agg_all_stay.columns]
-    lab_temporal_features_list.append(agg_all_stay)
+        # Get admittime from the base dataframe for the relevant hadm_ids in the chunk
+        admittime_map = base.set_index('hadm_id')['admittime'].to_dict()
+        chunk['admittime'] = chunk['hadm_id'].map(admittime_map)
 
-    # Aggregate within the first 24 hours
-    agg_24h = labs_filtered[window_24h_mask].groupby(['hadm_id', 'label'])['valuenum'].agg(
-        ['mean', 'std', 'min', 'max', 'first', 'last']).unstack()
-    agg_24h.columns = [
-        f"lab_{'_'.join(map(str, col)).strip().replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')}_24h"
-        for col in agg_24h.columns]
-    lab_temporal_features_list.append(agg_24h)
+        # Drop rows where admittime could not be found (shouldn't happen with correct data, but safe)
+        chunk.dropna(subset=['admittime', 'charttime'], inplace=True)
 
-    # Combine all lab features
-    lab_features = pd.concat(lab_temporal_features_list,
-                             axis=1).reset_index()  # Use axis=1 for concatenating columns
+        # Calculate time difference from admittime in hours
+        chunk['time_from_admit'] = (chunk['charttime'] - chunk['admittime']).dt.total_seconds() / 3600.0
 
-    base = base.merge(lab_features, on='hadm_id', how='left')
+        # Filter for events after admission time
+        chunk = chunk[chunk['time_from_admit'] >= 0].copy()  # Use .copy()
+
+        if chunk.empty:
+            continue
+
+        # Merge with labitems to get labels
+        chunk = chunk.merge(labitems[['itemid', 'label']], on='itemid', how='left')
+        chunk.dropna(subset=['label'], inplace=True)  # Drop rows where label is missing
+
+        # --- Aggregate for All Stay ---
+        grouped_all_stay = chunk.groupby(['hadm_id', 'label'])['valuenum'].agg(
+            ['mean', 'std', 'min', 'max', 'first', 'last'])
+        lab_all_stay_chunks.append(grouped_all_stay)
+
+        # --- Aggregate for First 24 Hours ---
+        window_24h_mask = (chunk['time_from_admit'] >= 0) & (chunk['time_from_admit'] <= 24)
+        chunk_24h = chunk[window_24h_mask].copy()  # Use .copy()
+
+        if not chunk_24h.empty:
+            grouped_24h = chunk_24h.groupby(['hadm_id', 'label'])['valuenum'].agg(
+                ['mean', 'std', 'min', 'max', 'first', 'last'])
+            lab_24h_chunks.append(grouped_24h)
+
+    # Combine and unstack results from chunks
+    lab_features_list = []
+
+    if lab_all_stay_chunks:
+        print("Combining 'all stay' lab features...")
+        lab_all_stay = pd.concat(lab_all_stay_chunks).groupby(
+            ['hadm_id', 'label']).mean()  # Use mean to aggregate across chunks
+        lab_all_stay = lab_all_stay.unstack()
+        lab_all_stay.columns = [f"lab_{label.lower().replace(' ', '_')}_{stat}_allstay"
+                                for label, stat in lab_all_stay.columns]
+        lab_features_list.append(lab_all_stay)
+
+    if lab_24h_chunks:
+        print("Combining '24h' lab features...")
+        lab_24h = pd.concat(lab_24h_chunks).groupby(['hadm_id', 'label']).mean()  # Use mean to aggregate across chunks
+        lab_24h = lab_24h.unstack()
+        lab_24h.columns = [f"lab_{label.lower().replace(' ', '_')}_{stat}_24h"
+                           for label, stat in lab_24h.columns]
+        lab_features_list.append(lab_24h)
+
+    if lab_features_list:
+        # Concatenate all lab feature dataframes
+        lab_features = pd.concat(lab_features_list, axis=1).reset_index()
+        # Merge once to base
+        base = base.merge(lab_features, on='hadm_id', how='left')
+    else:
+        print("No lab data found for aggregation.")
+        # Create empty lab features if none were processed to avoid merge errors
+        # This requires knowing potential column names, which is complex.
+        # The left merge handles missing hadm_ids in lab_features if it's empty.
 
     # --- Temporal Vital Sign Features ---
     chartevents_itemids = {
@@ -247,75 +280,100 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     print(f"Processing chartevents for {len(target_chartevents_itemids)} target chart itemids...")
 
     # Load and filter chartevents with charttime and hadm_id (ensure hadm_id is present)
-    chart_chunks = pd.read_csv(
+    reader = pd.read_csv(
         f'{data_path}/icu/chartevents.csv.gz',
         usecols=['subject_id', 'hadm_id', 'stay_id', 'itemid', 'charttime', 'valuenum'],
-        # Include hadm_id and stay_id
         compression='gzip',
-        chunksize=1_000_000
+        chunksize=1_000_000,
+        dtype={
+            'subject_id': 'int32',
+            'hadm_id': 'float32',  # float because some might be NaN
+            'stay_id': 'float32',  # same reason as above
+            'itemid': 'int32',
+            'valuenum': 'float32'
+        },
+        parse_dates=['charttime']
     )
-    chart_filtered_chunks = [
-        chunk[chunk['itemid'].isin(target_chartevents_itemids)].copy()
-        for chunk in chart_chunks
-    ]
-    chart_filtered = pd.concat(chart_filtered_chunks, ignore_index=True)
+    chart_all_stay_chunks = []
+    chart_24h_icu_chunks = []
 
-    # Convert charttime to datetime
-    chart_filtered['charttime'] = pd.to_datetime(chart_filtered['charttime'], errors='coerce')
+    for chunk in tqdm(reader):
+        gc.collect()
 
-    # Merge with first_icustay to get intime for time window calculations relative to ICU admission
-    chart_filtered = chart_filtered.merge(
-        first_icustay[['stay_id', 'intime']],
-        on='stay_id',
-        how='left'  # Keep all chart events
-    )
+        filtered = chunk[chunk['itemid'].isin(target_chartevents_itemids)].copy()  # Use .copy()
+        if filtered.empty:
+            continue
 
-    # Calculate time difference from ICU intime in hours
-    chart_filtered['time_from_icu_intime'] = (chart_filtered['charttime'] - chart_filtered[
-        'intime']).dt.total_seconds() / 3600.0
+        # Ensure hadm_id and stay_id are int for merging, handle NaNs
+        filtered['hadm_id'] = filtered['hadm_id'].astype('Int64')
+        filtered['stay_id'] = filtered['stay_id'].astype('Int64')
+        filtered.dropna(subset=['hadm_id', 'stay_id'], inplace=True)  # Drop rows with missing hadm_id or stay_id
 
-    # Map itemids to meaningful names BEFORE aggregation
-    chart_filtered['label'] = chart_filtered['itemid'].map(chartevents_itemids)
-    # Drop rows where label is NaN (itemid wasn't in our target list)
-    chart_filtered.dropna(subset=['label'], inplace=True)
+        # Merge with first_icustay to get intime for time window calculations relative to ICU admission
+        # Get intime from first_icustay for the relevant stay_ids in the chunk
+        intime_map = first_icustay.set_index('stay_id')['intime'].to_dict()
+        filtered['intime'] = filtered['stay_id'].map(intime_map)
 
-    # Define time windows relative to ICU intime (e.g., first 24 hours)
-    # Ensure we only consider values recorded AFTER ICU intime or slightly before for convenience
-    window_24h_icu_mask = (chart_filtered['time_from_icu_intime'] >= 0) & (
-                chart_filtered['time_from_icu_intime'] <= 24)
+        # Drop rows where intime could not be found (event outside known ICU stays)
+        filtered.dropna(subset=['intime', 'charttime'], inplace=True)
 
-    # Aggregate temporal vital sign features per HADM_ID (since features are linked to admission)
-    # We need to aggregate per hadm_id, even though times are relative to stay_id's intime
-    vital_sign_temporal_features_list = []
+        # Calculate time difference from ICU intime in hours
+        filtered['time_from_icu_intime'] = (filtered['charttime'] - filtered['intime']).dt.total_seconds() / 3600.0
 
-    # Aggregate over the entire ICU stay duration associated with the admission
-    # Filter for valid times relative to ICU intime
-    chart_valid_times = chart_filtered[chart_filtered['time_from_icu_intime'] >= 0]
+        # Map itemids to meaningful names BEFORE aggregation
+        filtered['label'] = filtered['itemid'].map(chartevents_itemids)
+        # Drop rows where label is NaN (itemid wasn't in our target list)
+        filtered.dropna(subset=['label', 'hadm_id'], inplace=True)  # Also ensure hadm_id is not NaN
 
-    if not chart_valid_times.empty:
-        agg_all_stay_vs = chart_valid_times.groupby(['hadm_id', 'label'])['valuenum'].agg(
-            ['mean', 'std', 'min', 'max', 'first', 'last']).unstack()
-        agg_all_stay_vs.columns = [f"vs_{'_'.join(map(str, col)).strip().replace(' ', '_')}_allstay" for col in
-                                   agg_all_stay_vs.columns]
-        vital_sign_temporal_features_list.append(agg_all_stay_vs)
+        if filtered.empty:
+            continue
 
-        # Aggregate within the first 24 hours of ICU stay
-        agg_24h_icu = chart_filtered[window_24h_icu_mask].groupby(['hadm_id', 'label'])['valuenum'].agg(
-            ['mean', 'std', 'min', 'max', 'first', 'last']).unstack()
-        agg_24h_icu.columns = [f"vs_{'_'.join(map(str, col)).strip().replace(' ', '_')}_24hicu" for col in
-                               agg_24h_icu.columns]
-        vital_sign_temporal_features_list.append(agg_24h_icu)
+        # --- Aggregate for All ICU Stay (relative to ICU intime) ---
+        # Filter for valid times relative to ICU intime
+        chart_valid_times = filtered[filtered['time_from_icu_intime'] >= 0].copy()  # Use .copy()
+
+        if not chart_valid_times.empty:
+            agg_all_stay_vs = chart_valid_times.groupby(['hadm_id', 'label'])['valuenum'].agg(
+                ['mean', 'std', 'min', 'max', 'first', 'last'])
+            chart_all_stay_chunks.append(agg_all_stay_vs)
+
+        # --- Aggregate within the first 24 hours of ICU stay ---
+        window_24h_icu_mask = (filtered['time_from_icu_intime'] >= 0) & (filtered['time_from_icu_intime'] <= 24)
+        chunk_24h_icu = filtered[window_24h_icu_mask].copy()  # Use .copy()
+
+        if not chunk_24h_icu.empty:
+            agg_24h_icu = chunk_24h_icu.groupby(['hadm_id', 'label'])['valuenum'].agg(
+                ['mean', 'std', 'min', 'max', 'first', 'last'])
+            chart_24h_icu_chunks.append(agg_24h_icu)
+
+    # Combine and unstack results from chunks
+    vital_sign_features_list = []
+
+    if chart_all_stay_chunks:
+        print("Combining 'all stay' vital sign features...")
+        vital_sign_all_stay = pd.concat(chart_all_stay_chunks).groupby(
+            ['hadm_id', 'label']).mean()  # Aggregate across chunks
+        vital_sign_all_stay = vital_sign_all_stay.unstack()
+        vital_sign_all_stay.columns = [f"vs_{'_'.join(map(str, col)).strip().replace(' ', '_')}_allstay" for col in
+                                       vital_sign_all_stay.columns]
+        vital_sign_features_list.append(vital_sign_all_stay)
+
+    if chart_24h_icu_chunks:
+        print("Combining '24h ICU' vital sign features...")
+        vital_sign_24h_icu = pd.concat(chart_24h_icu_chunks).groupby(
+            ['hadm_id', 'label']).mean()  # Aggregate across chunks
+        vital_sign_24h_icu = vital_sign_24h_icu.unstack()
+        vital_sign_24h_icu.columns = [f"vs_{'_'.join(map(str, col)).strip().replace(' ', '_')}_24hicu" for col in
+                                      vital_sign_24h_icu.columns]
+        vital_sign_features_list.append(vital_sign_24h_icu)
 
     # Combine all vital sign features
-    if vital_sign_temporal_features_list:
-        vital_sign_features = pd.concat(vital_sign_temporal_features_list, axis=1).reset_index()
+    if vital_sign_features_list:
+        vital_sign_features = pd.concat(vital_sign_features_list, axis=1).reset_index()
         base = base.merge(vital_sign_features, on='hadm_id', how='left')
     else:
         print("No vital sign data found for aggregation windows.")
-        # Create empty columns to avoid merge errors later if no data exists
-        # This requires knowing the expected columns, which is tricky without data.
-        # A safer approach is to check for existence before merge.
-        pass  # The left merge handles cases where vital_sign_features is empty/missing hadm_ids
+        # The left merge handles cases where vital_sign_features is empty/missing hadm_ids
 
     # Medication Features (Count unique medications prescribed per admission - keep simple for now)
     prescriptions = pd.read_csv(
@@ -333,36 +391,102 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
 
     # --- Final Data Preparation ---
 
-    # Drop columns used for merging or target calculation
-    cols_to_drop = [
+    # Columns to exclude from features in the final step
+    cols_to_exclude_from_features = [
         'subject_id', 'hadm_id', 'stay_id', 'admittime', 'dischtime', 'next_admit',
         'time_to_next_admit', 'anchor_age', 'anchor_year', 'anchor_year_group',
-        'dod', 'hospital_expire_flag', 'intime'  # Drop intime after use
+        'dod', 'hospital_expire_flag', 'intime',  # Drop intime after use
+        'readmit_30d'  # This is the label, so exclude from features
+        # Any other temporary columns used during processing that shouldn't be features
     ]
-    base.drop(columns=cols_to_drop, errors='ignore', inplace=True)
 
-    # Separate features and labels
+    # Separate labels BEFORE creating the final features DataFrame
     labels = base['readmit_30d']
-    features = base.drop(columns=['readmit_30d'])
 
-    print(f"Generated {len(features.columns)} features.")
+    # Create the initial features DataFrame by selecting desired columns from base
+    # This creates a new, non-fragmented DataFrame
+    feature_cols = [col for col in base.columns if col not in cols_to_exclude_from_features]
+    features = base[feature_cols].copy()  # Use .copy() to ensure it's a distinct DataFrame
 
-    # Handle remaining NaNs
-    # Identify columns with NaNs after merging
-    nan_cols = features.columns[features.isnull().any()].tolist()
+    print(f"Initial feature selection generated {len(features.columns)} features.")
 
-    # Add missing indicator features for columns with NaNs (optional, but can be helpful)
-    # Let's add indicators for some key aggregated features if they have NaNs
-    aggregated_cols = [col for col in nan_cols if col.startswith('lab_') or col.startswith('vs_')]
-    for col in aggregated_cols:
-        features[f'{col}_ismissing'] = features[col].isna().astype(int)
+    # Handle remaining NaNs and add missing indicators more efficiently
 
-    # Fill remaining NaNs (consider different strategies - 0 is simple, but mean/median might be better)
-    # Using 0 for now for consistency with the original, but this is a point to experiment
+    # Identify columns with NaNs *before* filling
+    nan_cols_before_filling = features.columns[features.isnull().any()].tolist()
+
+    # Create missing indicator features in a separate DataFrame
+    missing_indicator_features_list = []
+    # Only add indicators for aggregated features if they have NaNs
+    aggregated_cols_with_nan = [col for col in nan_cols_before_filling if
+                                col.startswith('lab_') or col.startswith('vs_')]
+
+    if aggregated_cols_with_nan:
+        print(f"Creating missing indicators for {len(aggregated_cols_with_nan)} aggregated columns with NaNs...")
+        for col in aggregated_cols_with_nan:
+            # Create the indicator Series
+            indicator_series = features[col].isna().astype(int)
+            indicator_series.name = f'{col}_ismissing'  # Name the series
+            missing_indicator_features_list.append(indicator_series)
+
+    # Concatenate all missing indicator Series into a single DataFrame
+    if missing_indicator_features_list:
+        missing_indicators_df = pd.concat(missing_indicator_features_list, axis=1)
+        # Concatenate the main features DataFrame and the missing indicator DataFrame
+        features = pd.concat([features, missing_indicators_df], axis=1)
+        print(f"Total features after adding indicators: {len(features.columns)}")
+
+    # Fill remaining NaNs in the main features DataFrame (including newly added indicator columns if any had NaNs, though they shouldn't)
+    print("Filling remaining NaNs with 0...")
     features.fillna(0, inplace=True)
+
+    # --- Optimize Data Types (Downcasting) ---
+    print("Optimizing data types to reduce memory usage...")
+    initial_memory = features.memory_usage(deep=True).sum() / (1024 ** 3)  # in GB
+
+    for col in features.columns:
+        col_type = features[col].dtype
+
+        # Downcast floats
+        if col_type == 'float64':
+            # Use ._check_values for older pandas versions if needed, but astype handles conversion
+            # Check if column contains non-finite values (NaN, inf) that need to be handled
+            if features[col].hasnans:
+                # If NaNs are present, downcasting to float32 is usually safe
+                features[col] = features[col].astype('float32')
+            else:
+                # If no NaNs, can try converting to integer first if possible
+                # This step is optional but can save more memory if floats are actually integers
+                temp_int = features[col].astype('int64', errors='ignore')
+                if (temp_int == features[col]).all():
+                    features[col] = temp_int.astype('int32', errors='ignore')  # Try int32
+                    if features[col].dtype == 'int64':  # If int32 failed, stick to float32
+                        features[col] = features[col].astype('float32')
+                else:
+                    features[col] = features[col].astype('float32')
+
+
+        # Downcast integers
+        elif col_type == 'int64':
+            # Check if min/max fit in smaller integer types
+            c_min = features[col].min()
+            c_max = features[col].max()
+            if c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
+                features[col] = features[col].astype('int32')
+            elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
+                features[col] = features[col].astype('int16')
+            elif c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
+                features[col] = features[col].astype('int8')
+
+    final_memory = features.memory_usage(deep=True).sum() / (1024 ** 3)  # in GB
+    print(f"Memory usage before downcasting: {initial_memory:.2f} GB")
+    print(f"Memory usage after downcasting: {final_memory:.2f} GB")
+    print(f"Memory saved: {initial_memory - final_memory:.2f} GB")
+    print("Data type optimization complete.")
 
     # Save to cache
     print(f"Saving processed data to {cache_file}")
+    # The index of features should be aligned with labels since features was derived from base
     joblib.dump((features, labels), cache_file)
 
     print("Data processing complete.")
