@@ -8,7 +8,6 @@ from cuml.model_selection import StratifiedKFold
 from cuml.preprocessing import OneHotEncoder
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
-from imblearn.under_sampling import RandomUnderSampler
 from numba.cuda import current_context
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -79,7 +78,7 @@ def objective(trial, X, y):
     scores = []
 
     for train_idx, val_idx in cv.split(X, y):
-        X_train_cv, X_val_cv = X.iloc[train_idx.get()], X.iloc[val_idx.get()]
+        X_train_cv, X_val_cv = X.iloc[train_idx.get()].fillna(0), X.iloc[val_idx.get()].fillna(0)
         y_train_cv, y_val_cv = y.iloc[train_idx.get()], y.iloc[val_idx.get()]
 
         model = RandomForestClassifier(

@@ -1,10 +1,12 @@
 import gc
 import os
-from hashlib import md5
-import joblib
-import numpy as np
+
+import dask_cudf
 import pandas as pd
 from tqdm import tqdm
+
+
+CHUNK_SIZE = 10**7  # Adjust based on memory constraints
 
 
 def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
@@ -16,9 +18,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         cache_path (str): Path to the directory for caching processed data.
 
     Returns:
-        tuple: A tuple containing:
-            - features (pd.DataFrame): DataFrame of engineered features.
-            - labels (pd.Series): Series of the target variable (30-day readmission).
+        A Parquet file containing the processed data.
     """
     os.makedirs(cache_path, exist_ok=True)
 
@@ -26,12 +26,12 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     # For simplicity, let's just base it on data_path for now.
     cache_file = os.path.join(
         cache_path,
-        f'mimic_iv_31_{md5(data_path.encode()).hexdigest()}.joblib'
+        'mimic_iv_31.parquet'
     )
 
     if os.path.exists(cache_file):
         print(f"Loading cached data from {cache_file}")
-        return joblib.load(cache_file)
+        return dask_cudf.read_parquet(cache_file)
 
     print("Processing data for hospitalization risk prediction...")
 
@@ -58,19 +58,19 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     )
 
     # Merge patient demographics to admissions
-    base = admissions.merge(patients, on='subject_id', how='left')
+    features = admissions.merge(patients, on='subject_id', how='left')
 
     # --- Target Variable: 30-day Readmission ---
     # Sort by subject_id and admittime to find the next admission
-    base.sort_values(['subject_id', 'admittime'], inplace=True)
-    base['next_admit'] = base.groupby('subject_id')['admittime'].shift(-1)
-    base['time_to_next_admit'] = (
-                                         base['next_admit'] - base['dischtime']
+    features.sort_values(['subject_id', 'admittime'], inplace=True)
+    features['next_admit'] = features.groupby('subject_id')['admittime'].shift(-1)
+    features['time_to_next_admit'] = (
+                                         features['next_admit'] - features['dischtime']
                                  ).dt.total_seconds() / (24 * 3600)
 
     # Flag 30-day readmits
-    base['readmit_30d'] = (
-        base['time_to_next_admit']
+    features['readmit_30d'] = (
+        features['time_to_next_admit']
         .le(30)
         .fillna(False)  # Readmission within 30 days is False if no next admission
         .astype(int)
@@ -79,24 +79,24 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     # --- Feature Engineering ---
 
     # Demographics
-    base['age'] = base['anchor_age'] + (
-            base['admittime'].dt.year - base['anchor_year']
+    features['age'] = features['anchor_age'] + (
+            features['admittime'].dt.year - features['anchor_year']
     )
-    base['died_in_hospital'] = base['hospital_expire_flag'].astype(int)
+    features['died_in_hospital'] = features['hospital_expire_flag'].astype(int)
     # Gender - Convert to numeric
-    base['gender_M'] = (base['gender'] == 'M').astype(int)
-    base.drop(columns=['gender'], inplace=True)  # Drop original gender
+    features['gender_M'] = (features['gender'] == 'M').astype(int)
+    features.drop(columns=['gender'], inplace=True)  # Drop original gender
 
     # Admission details (categorical features)
     categorical_cols = ['admission_type', 'admission_location', 'discharge_location', 'insurance', 'language',
                         'marital_status', 'race']
-    base = pd.get_dummies(base, columns=categorical_cols, dummy_na=False, prefix='adm')  # Add prefix
+    features = pd.get_dummies(features, columns=categorical_cols, dummy_na=False, prefix='adm')  # Add prefix
 
     # ICU Stay Features (Associate first ICU stay with admission if exists)
     first_icustay = icustays.groupby('hadm_id').first().reset_index()[['hadm_id', 'stay_id', 'los', 'intime']]
-    base = base.merge(first_icustay, on='hadm_id', how='left')
+    features = features.merge(first_icustay, on='hadm_id', how='left')
     # Add binary feature indicating if the admission had an ICU stay
-    base['has_icu_stay'] = (~base['stay_id'].isna()).astype(int)
+    features['has_icu_stay'] = (~features['stay_id'].isna()).astype(int)
 
     # Diagnosis Features - Add features for common diagnoses
     diagnoses_icd = pd.read_csv(
@@ -110,7 +110,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
                    .nunique()
                    .to_frame('num_unique_diagnoses')
                    .reset_index())
-    base = base.merge(diag_counts, on='hadm_id', how='left')
+    features = features.merge(diag_counts, on='hadm_id', how='left')
 
     # Identify top N common diagnoses (Example: top 50 or 100, adjust as needed)
     # We'll use the first listed diagnosis (seq_num == 1) as it's often the primary reason for admission
@@ -131,16 +131,16 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         # Get the hadm_ids that have this primary diagnosis
         hadm_ids_with_code = primary_diagnoses[primary_diagnoses['icd_code'] == code]['hadm_id']
         # Create a boolean Series, indexed by hadm_id, indicating presence
-        # Use base['hadm_id'].isin(...) but create the Series outside the base DataFrame
-        is_present = base['hadm_id'].isin(hadm_ids_with_code).astype(int)
+        # Use features['hadm_id'].isin(...) but create the Series outside the base DataFrame
+        is_present = features['hadm_id'].isin(hadm_ids_with_code).astype(int)
         is_present.name = col_name  # Name the Series with the desired column name
         new_diag_features_list.append(is_present)
 
     # Concatenate all the new Series into a single DataFrame
     new_diag_features_df = pd.concat(new_diag_features_list, axis=1)
     # Ensure the index of new_diag_features_df aligns with base before merging on index
-    new_diag_features_df.index = base.index
-    base = base.merge(new_diag_features_df, left_index=True, right_index=True, how='left')
+    new_diag_features_df.index = features.index
+    features = features.merge(new_diag_features_df, left_index=True, right_index=True, how='left')
 
     # Procedure Features - Keep count (this part was fine)
     procedures_icd = pd.read_csv(
@@ -154,7 +154,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
                    .nunique()
                    .to_frame('num_unique_procedures')
                    .reset_index())
-    base = base.merge(proc_counts, on='hadm_id', how='left')
+    features = features.merge(proc_counts, on='hadm_id', how='left')
 
     # --- Temporal Lab Features ---
     target_labs = [
@@ -176,7 +176,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         f'{data_path}/hosp/labevents.csv.gz',
         usecols=['subject_id', 'hadm_id', 'itemid', 'charttime', 'valuenum'],
         compression='gzip',
-        chunksize=1_000_000,
+        chunksize=CHUNK_SIZE,
         dtype={
             'subject_id': 'int32',
             'hadm_id': 'float32',  # float because some might be NaN
@@ -203,7 +203,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         chunk['hadm_id'] = chunk['hadm_id'].astype('Int64')  # Use nullable Int64
 
         # Get admittime from the base dataframe for the relevant hadm_ids in the chunk
-        admittime_map = base.set_index('hadm_id')['admittime'].to_dict()
+        admittime_map = features.set_index('hadm_id')['admittime'].to_dict()
         chunk['admittime'] = chunk['hadm_id'].map(admittime_map)
 
         # Drop rows where admittime could not be found (shouldn't happen with correct data, but safe)
@@ -259,8 +259,8 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     if lab_features_list:
         # Concatenate all lab feature dataframes
         lab_features = pd.concat(lab_features_list, axis=1).reset_index()
-        # Merge once to base
-        base = base.merge(lab_features, on='hadm_id', how='left')
+        # Merge once to features
+        features = features.merge(lab_features, on='hadm_id', how='left')
     else:
         print("No lab data found for aggregation.")
         # Create empty lab features if none were processed to avoid merge errors
@@ -284,7 +284,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         f'{data_path}/icu/chartevents.csv.gz',
         usecols=['subject_id', 'hadm_id', 'stay_id', 'itemid', 'charttime', 'valuenum'],
         compression='gzip',
-        chunksize=1_000_000,
+        chunksize=CHUNK_SIZE,
         dtype={
             'subject_id': 'int32',
             'hadm_id': 'float32',  # float because some might be NaN
@@ -370,7 +370,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     # Combine all vital sign features
     if vital_sign_features_list:
         vital_sign_features = pd.concat(vital_sign_features_list, axis=1).reset_index()
-        base = base.merge(vital_sign_features, on='hadm_id', how='left')
+        features = features.merge(vital_sign_features, on='hadm_id', how='left')
     else:
         print("No vital sign data found for aggregation windows.")
         # The left merge handles cases where vital_sign_features is empty/missing hadm_ids
@@ -387,7 +387,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
                    .nunique()
                    .to_frame('num_unique_drugs')
                    .reset_index())
-    base = base.merge(drug_counts, on='hadm_id', how='left')
+    features = features.merge(drug_counts, on='hadm_id', how='left')
 
     # --- Final Data Preparation ---
 
@@ -400,95 +400,42 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
         # Any other temporary columns used during processing that shouldn't be features
     ]
 
-    # Separate labels BEFORE creating the final features DataFrame
-    labels = base['readmit_30d']
+    # Separate labels BEFORE dropping columns
+    labels = features['readmit_30d']
 
-    # Create the initial features DataFrame by selecting desired columns from base
-    # This creates a new, non-fragmented DataFrame
-    feature_cols = [col for col in base.columns if col not in cols_to_exclude_from_features]
-    features = base[feature_cols].copy()  # Use .copy() to ensure it's a distinct DataFrame
-
+    # Create the initial features DataFrame
     print(f"Initial feature selection generated {len(features.columns)} features.")
+    features.drop(columns=cols_to_exclude_from_features, inplace=True)
 
     # Handle remaining NaNs and add missing indicators more efficiently
+    aggregated_cols = [c for c in features.columns
+                       if c.startswith('lab_') or c.startswith('vs_')]
+    cols_with_nan = [c for c in aggregated_cols if features[c].isna().any()]
 
-    # Identify columns with NaNs *before* filling
-    nan_cols_before_filling = features.columns[features.isnull().any()].tolist()
+    # Drop columns with NaNs in the aggregated features
+    features.drop(columns=cols_with_nan, inplace=True)
 
-    # Create missing indicator features in a separate DataFrame
-    missing_indicator_features_list = []
-    # Only add indicators for aggregated features if they have NaNs
-    aggregated_cols_with_nan = [col for col in nan_cols_before_filling if
-                                col.startswith('lab_') or col.startswith('vs_')]
+    # Detect duplicate columns
+    duplicates = features.columns[features.columns.duplicated()].tolist()
+    if duplicates:
+        print(f"{len(duplicates)} duplicate columns detected and will be dropped: {duplicates}")
+        features = features.loc[:, ~features.columns.duplicated()]
 
-    if aggregated_cols_with_nan:
-        print(f"Creating missing indicators for {len(aggregated_cols_with_nan)} aggregated columns with NaNs...")
-        for col in aggregated_cols_with_nan:
-            # Create the indicator Series
-            indicator_series = features[col].isna().astype(int)
-            indicator_series.name = f'{col}_ismissing'  # Name the series
-            missing_indicator_features_list.append(indicator_series)
+    gc.collect()
 
-    # Concatenate all missing indicator Series into a single DataFrame
-    if missing_indicator_features_list:
-        missing_indicators_df = pd.concat(missing_indicator_features_list, axis=1)
-        # Concatenate the main features DataFrame and the missing indicator DataFrame
-        features = pd.concat([features, missing_indicators_df], axis=1)
-        print(f"Total features after adding indicators: {len(features.columns)}")
+    print('Final feature selection generated '
+          f'{len(features.columns)} features after dropping NaNs and duplicates.\n'
+          f'Features: {features.columns.tolist()}\n'
+          f'Labels: {labels.name}\n'
+          f'Starting to cache the data...\n')
 
-    # Fill remaining NaNs in the main features DataFrame (including newly added indicator columns if any had NaNs, though they shouldn't)
-    print("Filling remaining NaNs with 0...")
-    features.fillna(0, inplace=True)
+    # Combine features + label, write parquet, and return Dask-CuDF
+    df = pd.concat([features, labels.rename('readmit_30d')], axis=1)
+    df.to_parquet(
+        path=cache_file,
+        compression='snappy',
+        index=False
+    )
 
-    # --- Optimize Data Types (Downcasting) ---
-    print("Optimizing data types to reduce memory usage...")
-    initial_memory = features.memory_usage(deep=True).sum() / (1024 ** 3)  # in GB
-
-    for col in features.columns:
-        col_type = features[col].dtype
-
-        # Downcast floats
-        if col_type == 'float64':
-            # Use ._check_values for older pandas versions if needed, but astype handles conversion
-            # Check if column contains non-finite values (NaN, inf) that need to be handled
-            if features[col].hasnans:
-                # If NaNs are present, downcasting to float32 is usually safe
-                features[col] = features[col].astype('float32')
-            else:
-                # If no NaNs, can try converting to integer first if possible
-                # This step is optional but can save more memory if floats are actually integers
-                temp_int = features[col].astype('int64', errors='ignore')
-                if (temp_int == features[col]).all():
-                    features[col] = temp_int.astype('int32', errors='ignore')  # Try int32
-                    if features[col].dtype == 'int64':  # If int32 failed, stick to float32
-                        features[col] = features[col].astype('float32')
-                else:
-                    features[col] = features[col].astype('float32')
-
-
-        # Downcast integers
-        elif col_type == 'int64':
-            # Check if min/max fit in smaller integer types
-            c_min = features[col].min()
-            c_max = features[col].max()
-            if c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
-                features[col] = features[col].astype('int32')
-            elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
-                features[col] = features[col].astype('int16')
-            elif c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
-                features[col] = features[col].astype('int8')
-
-    final_memory = features.memory_usage(deep=True).sum() / (1024 ** 3)  # in GB
-    print(f"Memory usage before downcasting: {initial_memory:.2f} GB")
-    print(f"Memory usage after downcasting: {final_memory:.2f} GB")
-    print(f"Memory saved: {initial_memory - final_memory:.2f} GB")
-    print("Data type optimization complete.")
-
-    # Save to cache
-    print(f"Saving processed data to {cache_file}")
-    # The index of features should be aligned with labels since features was derived from base
-    joblib.dump((features, labels), cache_file)
-
-    print("Data processing complete.")
-
-    return features, labels
+    print(f"Data processing complete. Cached data saved.")
+    return dask_cudf.read_parquet(cache_file)

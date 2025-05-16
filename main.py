@@ -1,11 +1,9 @@
 from random import randint
-from time import time
 
 import optuna
-from cuml import RandomForestClassifier
+from cuml.dask.ensemble import RandomForestClassifier as DaskRF
 from sklearn.metrics import classification_report, confusion_matrix
 
-from covid import get_covid_19
 from mimic import get_mimic_iv_31
 from misc import prepare_data_split, objective
 
@@ -14,26 +12,27 @@ def main():
     name = 'MIMIC-IV 3.1'
     print(f'Loading {name} data...')
 
-    data_load_start = time()
-    data = get_mimic_iv_31() if name == 'MIMIC-IV 3.1' else get_covid_19()
-    X, y = data
-    data_load_end = time()
-
-    print(f"Data loaded in {data_load_end - data_load_start:.2f} seconds.")
+    data = get_mimic_iv_31()
+    data = data.compute()
+    y = data['readmit_30d']
+    X = data.drop('readmit_30d', axis=1)
 
     # Initial split to simulate train/test
-    X_train, X_test, y_train, y_test, numeric_cols, categorical_cols = prepare_data_split(X, y)
+    X_train, X_test, y_train, y_test, numeric_cols, categorical_cols = prepare_data_split(
+        X.to_pandas(),
+        y.to_pandas(),
+    )
 
     # Only optimize on the training set
     print("Starting hyperparameter optimization with Optuna...")
     study = optuna.create_study(direction='maximize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=2)
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=20)
 
     print("Best parameters:", study.best_params)
     print("Best CV accuracy:", study.best_value)
 
     # Final model with best parameters
-    best_model = RandomForestClassifier(**study.best_params, random_state=randint(0, 1000))
+    best_model = DaskRF(**study.best_params, random_state=randint(0, 1000))
     best_model.fit(X_train, y_train)
 
     print("\nEvaluating on test set...")
