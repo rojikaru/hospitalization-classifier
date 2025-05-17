@@ -1,12 +1,11 @@
 import gc
 import os
 
-import dask_cudf
+import dask.dataframe as dd
 import pandas as pd
 from tqdm import tqdm
 
-
-CHUNK_SIZE = 10**7  # Adjust based on memory constraints
+CHUNK_SIZE = 10 ** 7  # Adjust based on memory constraints
 
 
 def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
@@ -31,7 +30,7 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
 
     if os.path.exists(cache_file):
         print(f"Loading cached data from {cache_file}")
-        return dask_cudf.read_parquet(cache_file)
+        return dd.read_parquet(cache_file)
 
     print("Processing data for hospitalization risk prediction...")
 
@@ -65,8 +64,8 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     features.sort_values(['subject_id', 'admittime'], inplace=True)
     features['next_admit'] = features.groupby('subject_id')['admittime'].shift(-1)
     features['time_to_next_admit'] = (
-                                         features['next_admit'] - features['dischtime']
-                                 ).dt.total_seconds() / (24 * 3600)
+                                             features['next_admit'] - features['dischtime']
+                                     ).dt.total_seconds() / (24 * 3600)
 
     # Flag 30-day readmits
     features['readmit_30d'] = (
@@ -157,16 +156,29 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     features = features.merge(proc_counts, on='hadm_id', how='left')
 
     # --- Temporal Lab Features ---
+    # target_labs = [
+    #     'creatinine', 'glucose', 'wbc', 'hemoglobin', 'platelet', 'sodium',
+    #     'potassium', 'albumin', 'amylase', 'bicarbonate', 'bilirubin',
+    #     'uric acid', 'lactate', 'ph', 'pco2', 'po2', 'base excess', 'anion gap',
+    #     'alt', 'ast', 'bilirubin, total', 'ck', 'ck-mb', 'inr(pt)', 'pt', 'ptt',
+    #     'magnesium', 'calcium, total', 'phosphate', 'chloride', 'troponin',
+    # ]
     target_labs = [
-        'creatinine', 'glucose', 'wbc', 'hemoglobin', 'platelet', 'sodium',
-        'potassium', 'albumin', 'amylase', 'bicarbonate', 'bilirubin',
-        'uric acid', 'lactate', 'ph', 'pco2', 'po2', 'base excess', 'anion gap',
-        'alt', 'ast', 'bilirubin, total', 'ck', 'ck-mb', 'inr(pt)', 'pt', 'ptt',
-        'magnesium', 'calcium, total', 'phosphate', 'chloride', 'troponin',
+        'creatinine',     # kidney function
+        # 'potassium',      # electrolyte imbalance
+        # 'sodium',         # common and dangerous if abnormal
+        # 'wbc',            # infection/inflammation
+        # 'hemoglobin',     # anemia/bleeding
+        'lactate',        # sepsis/tissue hypoxia
+        # 'glucose',        # critical hypo/hyperglycemia
+        # 'ph',             # acid-base balance
+        # 'inr(pt)',        # bleeding/clotting risk
+        'troponin'        # cardiac damage
     ]
+
     labitems = pd.read_csv(f'{data_path}/hosp/d_labitems.csv.gz', compression='gzip')
     labels_lower = labitems['label'].fillna('').str.lower()
-    mask = labels_lower.str.extract(rf"({'|'.join(target_labs)})", expand=False).notna().any(axis=1)
+    mask = labels_lower.str.extract(rf"({'|'.join(target_labs)})", expand=False).notna().any()
     target_itemids_lab = labitems[mask]['itemid'].tolist()
 
     print(f"Processing labevents for {len(target_itemids_lab)} target lab itemids...")
@@ -405,23 +417,24 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
 
     # Create the initial features DataFrame
     print(f"Initial feature selection generated {len(features.columns)} features.")
-    features.drop(columns=cols_to_exclude_from_features, inplace=True)
+    features.drop(columns=cols_to_exclude_from_features, inplace=True, errors="ignore")
 
     # Handle remaining NaNs and add missing indicators more efficiently
     aggregated_cols = [c for c in features.columns
                        if c.startswith('lab_') or c.startswith('vs_')]
     cols_with_nan = [c for c in aggregated_cols if features[c].isna().any()]
 
-    # Drop columns with NaNs in the aggregated features
-    features.drop(columns=cols_with_nan, inplace=True)
-
     # Detect duplicate columns
     duplicates = features.columns[features.columns.duplicated()].tolist()
     if duplicates:
         print(f"{len(duplicates)} duplicate columns detected and will be dropped: {duplicates}")
         features = features.loc[:, ~features.columns.duplicated()]
-
+    del duplicates
     gc.collect()
+
+    # fill nans with 0 for numerical features
+    features.fillna({c: 0 for c in cols_with_nan}, inplace=True)
+    features.astype({ c: 'float32' for c in cols_with_nan }, copy=False)
 
     print('Final feature selection generated '
           f'{len(features.columns)} features after dropping NaNs and duplicates.\n'
@@ -434,8 +447,9 @@ def get_mimic_iv_31(data_path='datasets', cache_path='datasets/cache'):
     df.to_parquet(
         path=cache_file,
         compression='snappy',
-        index=False
+        index=False,
+        row_group_size=500,
     )
 
     print(f"Data processing complete. Cached data saved.")
-    return dask_cudf.read_parquet(cache_file)
+    return dd.read_parquet(cache_file)

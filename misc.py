@@ -3,83 +3,90 @@ from random import randint
 
 import cudf
 import numpy as np
-from cuml import RandomForestClassifier, accuracy_score
-from cuml.model_selection import StratifiedKFold
-from cuml.preprocessing import OneHotEncoder
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline
+import pandas as pd
+from cuml import RandomForestClassifier
+from dask_ml.model_selection import KFold as StratifiedKFold
+from dask_ml.preprocessing import DummyEncoder
 from numba.cuda import current_context
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+from sklearn.base import BaseEstimator, TransformerMixin
 
 
-def build_preprocessor(numeric_cols, categorical_cols):
-    numeric_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='mean')),
-        ('scaler', StandardScaler())
-    ])
+class ToCuDFTransformer(BaseEstimator, TransformerMixin):
+    """Convert pandas DataFrame to cuDF for GPU steps"""
+    def fit(self, X, y=None):
+        return self
 
-    categorical_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('encoder', OneHotEncoder(handle_unknown='ignore'))
-    ])
 
-    return ColumnTransformer([
-        ('num', numeric_pipeline, numeric_cols),
-        ('cat', categorical_pipeline, categorical_cols),
-    ])
-
+    def transform(self, X):
+        return cudf.DataFrame(X) if isinstance(X, pd.DataFrame) else X
 
 def prepare_data_split(
-    features, labels, test_size=0.2, random_state=42, min_non_missing=1
+    features, labels, test_size=0.2, random_state=42
 ):
-    X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=test_size, random_state=random_state, stratify=labels
+    # 1) Extract column‐name lists for downstream preprocessing:
+    categorical_cols = features.select_dtypes(include='object').columns.tolist()
+
+    # 2) Dask-ML lazy pipelines:
+    #    a) Categorize string columns
+    print(f'Categorizing {len(categorical_cols)} categorical columns...')
+    features = features.categorize(columns=categorical_cols)
+    gc.collect()
+    #    b) One-hot encode (🔧 Ensure numeric dtype (needed by cuML))
+    print(f'One-hot encoding {len(categorical_cols)} categorical columns...')
+    features = DummyEncoder().fit_transform(features).astype("float32")
+    gc.collect()
+
+    # 3) Materialize labels to numpy to get stratified indices
+    print(f'Materializing labels to numpy array...')
+    y_np = labels.compute()
+    idx = np.arange(len(y_np))
+
+    # 4) Stratified split of indices
+    print(f'Stratifying {len(y_np)} labels into train/test split...')
+    train_idx, test_idx = train_test_split(
+        idx,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y_np
     )
+    del y_np, idx
+    gc.collect()
 
-    non_missing_counts = X_train.notnull().sum()
-    cols_to_drop = non_missing_counts[non_missing_counts < min_non_missing].index.tolist()
-    X_train = X_train.drop(columns=cols_to_drop)
-    X_test  = X_test.drop(columns=cols_to_drop)
+    # 5) Turn features/labels into Dask Arrays (lazy) and index
+    print(f'Indexing {len(train_idx)} train and {len(test_idx)} test samples...')
+    X_arr = features.to_dask_array(lengths=True)
+    y_arr = labels.to_dask_array(lengths=True)
 
-    numeric_cols = X_train.select_dtypes(include='number').columns
-    categorical_cols = X_train.select_dtypes(include='object').columns
+    X_train, X_test = X_arr[train_idx], X_arr[test_idx]
+    y_train, y_test = y_arr[train_idx], y_arr[test_idx]
 
-    return X_train, X_test, y_train, y_test, numeric_cols, categorical_cols
+    # 6) Return Dask Arrays + plain‐list column names
+    return X_train, X_test, y_train, y_test
 
-
-def build_model_pipeline(preprocessor, model=None):
-    if model is None:
-        model = RandomForestClassifier(
-            n_estimators=500,
-            n_streams=1,
-            random_state=randint(0, 1000)
-        )
-
-    return Pipeline([
-        ('preprocessing', preprocessor),
-        ('smote', SMOTE(random_state=randint(0, 1000))),
-        # ('undersample', RandomUnderSampler(random_state=42)),
-        ('classifier', model)
-    ], verbose=True)
 
 def objective(trial, X, y):
+    gc.collect()
+    current_context().deallocations.clear()
+
     # Suggest hyperparameters
     search_space = {
-        'n_estimators': trial.suggest_int("n_estimators", 50, 100),
+        'n_estimators': trial.suggest_int("n_estimators", 50, 60),
         'max_depth': trial.suggest_int("max_depth", 3, 10),
         'min_samples_leaf': trial.suggest_int("min_samples_leaf", 1, 5)
     }
 
     # Cross-validation
-    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=randint(0, 1000))
+    cv = StratifiedKFold(n_splits=10, shuffle=True)
     scores = []
 
-    for train_idx, val_idx in cv.split(X, y):
-        X_train_cv, X_val_cv = X.iloc[train_idx.get()].fillna(0), X.iloc[val_idx.get()].fillna(0)
-        y_train_cv, y_val_cv = y.iloc[train_idx.get()], y.iloc[val_idx.get()]
+    for train_idx, val_idx in tqdm(cv.split(X, y)):
+        X_train_cv = cudf.DataFrame.from_pandas(
+            pd.DataFrame(X[train_idx].compute()).fillna(0)
+        )
+        y_train_cv = cudf.Series(y[train_idx].compute()).fillna(0)
 
         model = RandomForestClassifier(
             n_estimators=search_space['n_estimators'],
@@ -89,14 +96,21 @@ def objective(trial, X, y):
             random_state=randint(0, 1000),
         )
 
-        X_train_cv = cudf.DataFrame.from_pandas(X_train_cv)
-        y_train_cv = cudf.Series(y_train_cv)
-
         model.fit(X_train_cv, y_train_cv)
-        preds = model.predict(X_val_cv)
-        acc = accuracy_score(y_val_cv.to_numpy(), preds)
-        scores.append(acc)
 
+        # Convert validation data [Dask array → NumPy]
+        X_val_cv = X[val_idx].compute()
+        y_val_cv = y[val_idx].compute()
+
+        preds = model.predict(X_val_cv)
+        scores.append(f1_score(
+            y_val_cv,
+            preds,
+            zero_division=0,
+            average='weighted'
+        ))
+
+        del X_train_cv, X_val_cv, y_train_cv, y_val_cv
         gc.collect()
         current_context().deallocations.clear()
 
