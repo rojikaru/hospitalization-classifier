@@ -33,7 +33,7 @@ def main():
     # Only optimize on the training set
     print("Starting hyperparameter optimization with Optuna...")
     study = optuna.create_study(direction='maximize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=1)
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=20)
 
     print("Best parameters:", study.best_params)
     print("Best CV accuracy:", study.best_value)

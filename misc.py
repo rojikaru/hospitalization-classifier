@@ -73,9 +73,9 @@ def objective(trial, X, y):
 
     # Suggest hyperparameters
     search_space = {
-        'n_estimators': trial.suggest_int("n_estimators", 50, 60),
-        'max_depth': trial.suggest_int("max_depth", 3, 10),
-        'min_samples_leaf': trial.suggest_int("min_samples_leaf", 1, 5)
+        'n_estimators': trial.suggest_int("n_estimators", 50, 350),
+        'max_depth': trial.suggest_int("max_depth", 3, 50),
+        'min_samples_leaf': trial.suggest_int("min_samples_leaf", 3, 45)
     }
 
     # Cross-validation
