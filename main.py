@@ -8,6 +8,7 @@ import pandas as pd
 from cuml import RandomForestClassifier as cuRF
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import classification_report, confusion_matrix
 
 from mimic import get_mimic_iv_31
@@ -24,6 +25,8 @@ def main():
     # Initial split to simulate train/test
     print(f'Data loaded. Preparing data for training...')
     X_train, X_test, y_train, y_test = prepare_data_split(X, y)
+
+    all_cols = X.columns
     del X, y
     gc.collect()
 
@@ -70,9 +73,23 @@ def main():
     print("Confusion matrix:")
     print(confusion_matrix(y_test, y_pred))
 
-    plt.barh(X_train_pd.columns, best_model.feature_importances_)
+    # https://github.com/rapidsai/cuml/issues/3531
+    result = permutation_importance(
+        model_pipeline.named_steps['classifier'],
+        X_test_pd.values,  # Requires CPU data
+        y_test.compute(),
+        n_repeats=5,
+        random_state=42
+    )
+
+    plt.figure().set_figwidth(30)
+    plt.figure().set_figheight(30)
+    plt.barh(
+        all_cols,
+        result.importances_mean,
+    )
     plt.title('Feature Importance')
-    plt.show()
+    plt.show(savefig='feature_importance.png')
 
 
 if __name__ == '__main__':
